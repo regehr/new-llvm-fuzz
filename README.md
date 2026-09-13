@@ -16,7 +16,8 @@ LLVM IR files, partitioned by what `backend-tv` says about each one.
 3. Strips `target datalayout` and `target triple`, so the backend under test
    picks the target.
 4. Strips debug info and SSA value names (`opt -passes=strip`).
-5. Drops functions longer than `--max-insts` instructions.
+5. Rewrites the deprecated `undef` constant to `poison`, then drops functions
+   longer than `--max-insts` instructions.
 6. Renames the function to `@f` and renumbers other globals to `@g0`, `@g1`, ...
 7. Runs `backend-tv` and sorts the case by the verdict.
 
@@ -46,11 +47,15 @@ python3 harvest_tv_cases.py ~/llvm-project -o tv-cases --shuffle --limit-files 2
 
 ```
 tv-cases/
-├── mismatch/      cases where backend-tv found a miscompilation
-├── correct/       cases backend-tv validated
-├── logs/          backend-tv output for each kept case
-└── results.jsonl  one record per function validated, kept or not
+├── mismatch/  mismatch-logs/   backend-tv found a miscompilation
+├── correct/   correct-logs/    backend-tv validated the case
+├── crash/     crash-logs/      backend-tv crashed
+├── refused/   refused-logs/    backend-tv declined to process it
+└── results.jsonl               one record per function validated, kept or not
 ```
+
+Each `<verdict>-logs/` holds the `backend-tv` output for the cases in the
+directory beside it, under the same name. Timeouts are discarded.
 
 Kept files get random hex names. Provenance lives in `results.jsonl`, which
 records the source file and original function name for every case:
@@ -61,16 +66,17 @@ records the source file and original function name for every case:
 
 ### How cases are classified
 
-| `backend-tv` output | Verdict | Result |
+| `backend-tv` outcome | Verdict | Result |
 | --- | --- | --- |
-| `Value mismatch` | `mismatch` | kept in `mismatch/` |
-| `Transformation seems to be correct!` | `correct` | kept in `correct/` |
-| anything else | `other` | file deleted |
-| killed at `--hard-timeout` | `timeout` | file deleted |
+| crashed — killed by a signal, or LLVM's crash handler ran | `crash` | kept |
+| `Value mismatch` | `mismatch` | kept |
+| `Transformation seems to be correct!` | `correct` | kept |
+| anything else — unsupported constructs, lifting failures, IR the verifier rejects | `refused` | kept |
+| killed at `--hard-timeout`, or alive2 reports `ERROR: Timeout` | `timeout` | file deleted |
 
-Anything that is not a clear yes or no is discarded — solver timeouts,
-unsupported constructs, lifting failures, IR the verifier rejects — but is still
-recorded in `results.jsonl`.
+Crash is checked first: a process that hit the crash handler cannot be trusted
+to have printed a sound verdict. Every verdict is recorded in `results.jsonl`,
+including discarded timeouts.
 
 ### Options worth knowing
 
@@ -79,6 +85,7 @@ recorded in `results.jsonl`.
 | `--backend` | `riscv64` | passed through to `backend-tv -backend=` |
 | `-j`, `--jobs` | CPU count | one `backend-tv` process per worker |
 | `--max-insts` | `15` | drop functions longer than this (0 = no limit) |
+| `--undef` | `poison` | rewrite `undef` to `poison`; or `drop` the function, or `keep` it |
 | `--smt-timeout` | `15` | seconds, per SMT **query** (`--smt-to`) |
 | `--hard-timeout` | `--smt-timeout` + 5 | seconds of wall clock before a run is killed |
 | `--resume` | off | skip functions already in `results.jsonl` |

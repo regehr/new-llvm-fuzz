@@ -12,8 +12,9 @@ Pipeline
 4. Strip `target datalayout` / `target triple` (plus ModuleID/source_filename,
    which are per-source noise and would defeat de-duplication).
 5. Strip debug info and SSA value names with `opt -passes=strip`.
-6. Drop functions longer than --max-insts instructions (default 15), before
-   anything is handed to backend-tv.
+6. Rewrite the deprecated `undef` constant to `poison` (see --undef), then drop
+   functions longer than --max-insts instructions (default 15), before anything
+   is handed to backend-tv.
 7. Rename the extracted function to @f and renumber the other globals to @g0,
    @g1, ... keeping intrinsics and library functions, so a case reads without
    names inherited from whatever test it came from.  Any other global already called @f is
@@ -21,9 +22,13 @@ Pipeline
    much more effective, since identical bodies now hash identically.
 8. Run:  backend-tv -backend=<BACKEND> --smt-to=<MS> --fn=f file.ll
 9. Classify the output:
+       crashed (signal / crash handler)      -> keep in  OUT/crash/
        "Value mismatch"                      -> keep in  OUT/mismatch/
        "Transformation seems to be correct!" -> keep in  OUT/correct/
-       anything else (errors, timeouts, ...) -> delete the file
+       refused to process (unsupported, ...) -> keep in  OUT/refused/
+       processed but not proved either way   -> keep in  OUT/unproven/
+       timed out (ours or alive2's)          -> delete the file
+   Every kept case gets its backend-tv output alongside, in OUT/<verdict>-logs/.
 
 Kept files are named with a random hex string.  Provenance (source file and
 original function name) is recorded in OUT/results.jsonl, which is appended to
@@ -50,8 +55,65 @@ from concurrent.futures import ThreadPoolExecutor
 # "ERROR: Value mismatch" for a miscompile, "Transformation seems to be
 # correct!" for a validated function.
 # ---------------------------------------------------------------------------
-MISMATCH_RE = re.compile(r"Value mismatch")
+# alive2 reports unsoundness (llvm_util/compare.cpp Results::UNSOUND) with this
+# banner, whatever the specific check was -- Value mismatch, Target is more
+# poisonous than source, Target's return value is more undefined, Mismatch in
+# memory, or a differing return domain.  Matching only "Value mismatch" would
+# file the other four as refusals.
+UNSOUND_RE = re.compile(r"Transformation doesn't verify!")
+# ... except TYPE_CHECKER_FAILED prints the same banner and is an error, not a
+# miscompile.
+TYPECHECK_RE = re.compile(r"program doesn't type check!")
 CORRECT_RE = re.compile(r"Transformation seems to be correct!")
+# First diagnostic line, recorded alongside the verdict.
+REASON_RE = re.compile(r"^ERROR: (.+?)\s*$", re.M)
+# The end-of-run tally; authoritative when the process lives long enough to
+# print it, which a refusal often does not.
+SUMMARY_RE = re.compile(
+    r"^\s+(\d+) (correct|incorrect|failed-to-prove) transformations?\s*$", re.M)
+# A crash: killed by a signal, or LLVM's crash handler ran.  Every signal-killed
+# run observed printed both of the first two, and no cleanly-exiting run did.
+CRASH_RE = re.compile(r"PLEASE submit a bug report|Stack dump:"
+                      r"|UNREACHABLE executed|Assertion `")
+# alive2's own solver timeout, reported on a clean exit -- a timeout, not a refusal.
+SMT_TIMEOUT_RE = re.compile(r"^ERROR: Timeout", re.M)
+
+# Verdicts whose case file is kept, each in its own directory.
+KEPT_VERDICTS = ("mismatch", "correct", "crash", "refused", "unproven")
+
+
+def summary_counts(out):
+    """alive2's end-of-run tally, {} when it never got that far."""
+    return {kind: int(n) for n, kind in SUMMARY_RE.findall(out)}
+
+
+def classify(out, rc, timed_out):
+    """Map one backend-tv run to (verdict, reason).
+
+    Ordering matters.  A crash outranks the verdict strings because a process
+    that hit the crash handler cannot be trusted to have printed a sound
+    result.  TYPE_CHECKER_FAILED prints the same banner as unsoundness but is
+    an error, so it is excluded explicitly.
+    """
+    counts = summary_counts(out)
+    if timed_out:
+        verdict = "timeout"
+    elif (rc is not None and rc < 0) or CRASH_RE.search(out):
+        verdict = "crash"
+    elif UNSOUND_RE.search(out) and not TYPECHECK_RE.search(out):
+        verdict = "mismatch"
+    elif CORRECT_RE.search(out):
+        verdict = "correct"
+    elif SMT_TIMEOUT_RE.search(out):
+        verdict = "timeout"
+    elif counts.get("failed-to-prove", 0) > 0:
+        # alive2 processed the function but could not conclude, as opposed to
+        # refusing the input outright.
+        verdict = "unproven"
+    else:
+        verdict = "refused"
+    m = REASON_RE.search(out)
+    return verdict, (m.group(1)[:160] if m else None)
 
 # `define ... @name(` -- name is either a quoted string or a bare LLVM identifier.
 # A literal quote cannot appear inside a quoted name (it is spelled \22).
@@ -188,6 +250,49 @@ def strip_debug_module_flags(ir):
         if not re.search(r'!%s(?![0-9])' % i, rest):
             ir = rest
     return ir
+
+
+# comment | string | sigil-prefixed identifier | the bare `undef` keyword.
+# The sigil branch is what keeps `%undef`, `@undef` and `%struct.undef` intact.
+UNDEF_SCAN_RE = re.compile(
+    r';|"|[%@!$#](?:"[^"\n]*"|[-a-zA-Z$._0-9]*)|\bundef\b')
+
+
+def replace_undef(ir, repl="poison"):
+    """Rewrite the `undef` constant to `repl`; returns (ir, count).
+
+    Token-aware: `undef` inside a string constant, a metadata string or a
+    comment is left alone, as is any name that merely contains it.  A block
+    label `undef:` is skipped too -- references to it are spelled `%undef` and
+    would not be rewritten, so renaming the definition alone would break the IR.
+    """
+    out = []
+    i, n, count = 0, len(ir), 0
+    while i < n:
+        m = UNDEF_SCAN_RE.search(ir, i)
+        if m is None:
+            out.append(ir[i:])
+            break
+        out.append(ir[i:m.start()])
+        tok = m.group(0)
+        if tok == ';':                                  # comment to end of line
+            k = ir.find('\n', m.start())
+            k = n if k < 0 else k
+            out.append(ir[m.start():k])
+            i = k
+        elif tok == '"':                                # string constant
+            k = ir.find('"', m.start() + 1)
+            k = n if k < 0 else k + 1
+            out.append(ir[m.start():k])
+            i = k
+        elif tok == 'undef' and ir[m.end():m.end() + 1] != ':':
+            out.append(repl)
+            count += 1
+            i = m.end()
+        else:                                           # sigil name, or a label
+            out.append(tok)
+            i = m.end()
+    return "".join(out), count
 
 
 def count_instructions(ir):
@@ -466,11 +571,11 @@ class Harvester:
         self.stop = threading.Event()
 
         self.out = os.path.abspath(args.out)
-        self.dir_mismatch = os.path.join(self.out, "mismatch")
-        self.dir_correct = os.path.join(self.out, "correct")
-        self.dir_logs = os.path.join(self.out, "logs")
+        self.dirs = {v: os.path.join(self.out, v) for v in KEPT_VERDICTS}
+        self.log_dirs = {v: os.path.join(self.out, v + "-logs")
+                         for v in KEPT_VERDICTS}
         self.dir_extracted = os.path.join(self.out, "extracted")
-        for d in (self.dir_mismatch, self.dir_correct, self.dir_logs):
+        for d in list(self.dirs.values()) + list(self.log_dirs.values()):
             os.makedirs(d, exist_ok=True)
         if args.extract_only:
             os.makedirs(self.dir_extracted, exist_ok=True)
@@ -575,6 +680,14 @@ class Harvester:
         ir = STRIP_RE.sub("", out)
         if not self.args.no_strip:
             ir = strip_debug_module_flags(ir)
+        if self.args.undef != "keep":
+            ir2, nundef = replace_undef(ir)
+            if nundef:
+                if self.args.undef == "drop":
+                    self.stats.bump("dropped_undef")
+                    return None
+                self.stats.bump("undef_rewritten")
+                ir = ir2
         m = FUNC_DEF_RE.search(ir)
         if m is None:
             self.stats.bump("extract_empty")
@@ -641,29 +754,26 @@ class Harvester:
             out = out + err
             elapsed = time.time() - t0
 
-            if timed_out:
-                verdict = "timeout"
-            elif MISMATCH_RE.search(out):
-                verdict = "mismatch"
-            elif CORRECT_RE.search(out):
-                verdict = "correct"
-            else:
-                verdict = "other"
+            # Crash is checked before the verdict strings: a process that hit
+            # the crash handler cannot be trusted to have printed a sound
+            # result.  In 700 sampled runs the two never overlapped.
+            verdict, reason = classify(out, rc, timed_out)
 
             self.stats.bump(verdict)
             self.record({"src": os.path.relpath(src, self.args.tree),
                          "func": func, "name": name, "verdict": verdict,
                          "rc": rc, "seconds": round(elapsed, 2),
-                         "sha256": digest})
+                         "reason": reason, "sha256": digest})
 
-            if verdict in ("mismatch", "correct"):
-                dest = self.dir_mismatch if verdict == "mismatch" else self.dir_correct
-                shutil.move(tmp, os.path.join(dest, name + ".ll"))
+            if verdict in KEPT_VERDICTS:
+                shutil.move(tmp, os.path.join(self.dirs[verdict], name + ".ll"))
                 tmp = None
                 if not self.args.no_logs:
-                    with open(os.path.join(self.dir_logs, name + ".txt"), "w") as f:
-                        f.write("# %s.ll  <-  %s  @%s\n" %
-                                (name, os.path.relpath(src, self.args.tree), func))
+                    log = os.path.join(self.log_dirs[verdict], name + ".txt")
+                    with open(log, "w") as f:
+                        f.write("# %s.ll  [%s]  <-  %s  @%s\n" %
+                                (name, verdict,
+                                 os.path.relpath(src, self.args.tree), func))
                         f.write("$ %s -backend=%s --smt-to=%d --fn=%s %s.ll\n\n" %
                                 (self.args.backend_tv, self.args.backend,
                                  int(self.args.smt_timeout * 1000), fn_name, name))
@@ -684,11 +794,12 @@ class Harvester:
         eta = (total - done) / rate if rate > 0 else 0
         s = self.stats.snapshot()
         sys.stderr.write(
-            "%s[%s] %d/%d  %.1f/s  eta %s  mismatch=%d correct=%d other=%d timeout=%d dup=%d   %s"
+            "%s[%s] %d/%d  %.1f/s  eta %s  mismatch=%d correct=%d crash=%d "
+            "refused=%d unproven=%d timeout=%d dup=%d   %s"
             % ("\r" if tty else "", phase, done, total, rate, fmt_dur(eta),
-               s.get("mismatch", 0), s.get("correct", 0), s.get("other", 0),
-               s.get("timeout", 0), s.get("duplicates", 0),
-               "" if tty else "\n"))
+               s.get("mismatch", 0), s.get("correct", 0), s.get("crash", 0),
+               s.get("refused", 0), s.get("unproven", 0), s.get("timeout", 0),
+               s.get("duplicates", 0), "" if tty else "\n"))
         sys.stderr.flush()
 
     def run(self):
@@ -740,9 +851,13 @@ class Harvester:
         sys.stderr.write("\n\nsummary:\n")
         for k, v in sorted(self.stats.snapshot().items()):
             sys.stderr.write("  %-32s %d\n" % (k, v))
-        sys.stderr.write("\n  mismatch cases -> %s\n" % self.dir_mismatch)
-        sys.stderr.write("  correct cases  -> %s\n" % self.dir_correct)
-        sys.stderr.write("  full log       -> %s\n" % self.jsonl_path)
+        sys.stderr.write("\n")
+        for v in KEPT_VERDICTS:
+            sys.stderr.write("  %-8s -> %s/  (logs in %s/)\n"
+                             % (v, os.path.basename(self.dirs[v]),
+                                os.path.basename(self.log_dirs[v])))
+        sys.stderr.write("  under %s\n" % self.out)
+        sys.stderr.write("  full log -> %s\n" % self.jsonl_path)
         self.jsonl.close()
         return 0
 
@@ -814,6 +929,10 @@ def main(argv):
                          "before running backend-tv (0 = no limit)")
     ap.add_argument("--func-name", default="f",
                     help="rename every extracted function to this name")
+    ap.add_argument("--undef", choices=["poison", "drop", "keep"],
+                    default="poison",
+                    help="what to do with the deprecated undef constant: "
+                         "rewrite it to poison, drop the function, or leave it")
     ap.add_argument("--no-strip", action="store_true",
                     help="skip `opt -passes=strip`, keeping debug info and "
                          "SSA value names")
