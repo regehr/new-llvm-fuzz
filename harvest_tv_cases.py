@@ -793,8 +793,11 @@ def main(argv):
     ap.add_argument("--backend", default="riscv64", help="backend-tv -backend value")
     ap.add_argument("--smt-timeout", type=float, default=15.0,
                     help="SMT query timeout in seconds (--smt-to)")
-    ap.add_argument("--hard-timeout", type=float, default=300.0,
-                    help="wall-clock kill timeout for one backend-tv run, seconds")
+    # SUPPRESS keeps ArgumentDefaultsHelpFormatter from printing a bogus
+    # "(default: None)"; the real default is derived from --smt-timeout below.
+    ap.add_argument("--hard-timeout", type=float, default=argparse.SUPPRESS,
+                    help="wall-clock kill timeout for one backend-tv run, "
+                         "seconds (default: --smt-timeout plus 5)")
     ap.add_argument("--tool-timeout", type=float, default=120.0,
                     help="wall-clock timeout for llvm-dis/llvm-extract, seconds")
     ap.add_argument("--backend-tv",
@@ -867,6 +870,8 @@ def main(argv):
         LIBFUNCS = frozenset(LIBFUNCS | extra)
         sys.stderr.write("preserving %d library names (%d from %s)\n"
                          % (len(LIBFUNCS), len(extra), args.libfuncs_file))
+    if not hasattr(args, "hard_timeout"):
+        args.hard_timeout = args.smt_timeout + 5.0
     if args.max_insts < 0:
         sys.exit("--max-insts must not be negative")
     if args.name_bytes < 4:
