@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.pyc
+
+# Harvested corpora: default output directory of harvest_tv_cases.py.
+# A full run produces tens of thousands of .ll files plus results.jsonl.
+tv-cases/
