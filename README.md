@@ -50,7 +50,8 @@ tv-cases/
 ├── mismatch/  mismatch-logs/   backend-tv found a miscompilation
 ├── correct/   correct-logs/    backend-tv validated the case
 ├── crash/     crash-logs/      backend-tv crashed
-├── refused/   refused-logs/    backend-tv declined to process it
+├── refused/   refused-logs/    backend-tv could not process it
+├── unproven/  unproven-logs/   processed, but proved nothing either way
 └── results.jsonl               one record per function validated, kept or not
 ```
 
@@ -61,7 +62,7 @@ Kept files get random hex names. Provenance lives in `results.jsonl`, which
 records the source file and original function name for every case:
 
 ```json
-{"src": "CodeGen/SystemZ/and-04.ll", "func": "f14", "name": "1bcc83...", "verdict": "correct", "rc": 0, "seconds": 0.08, "sha256": "..."}
+{"src": "CodeGen/SystemZ/and-04.ll", "func": "f14", "name": "1bcc83...", "verdict": "correct", "rc": 0, "seconds": 0.08, "reason": null, "sha256": "..."}
 ```
 
 ### How cases are classified
@@ -69,10 +70,17 @@ records the source file and original function name for every case:
 | `backend-tv` outcome | Verdict | Result |
 | --- | --- | --- |
 | crashed — killed by a signal, or LLVM's crash handler ran | `crash` | kept |
-| `Value mismatch` | `mismatch` | kept |
+| `Transformation doesn't verify!` — any unsoundness | `mismatch` | kept |
 | `Transformation seems to be correct!` | `correct` | kept |
-| anything else — unsupported constructs, lifting failures, IR the verifier rejects | `refused` | kept |
+| `failed-to-prove` that is not a timeout | `unproven` | kept |
+| anything else — unsupported constructs, lifting failures, IR that fails to type check | `refused` | kept |
 | killed at `--hard-timeout`, or alive2 reports `ERROR: Timeout` | `timeout` | file deleted |
+
+`mismatch` keys on alive2's unsoundness banner, not on one message, so it covers
+every miscompile it can report: `Value mismatch`, `Target is more poisonous than
+source`, `Target's return value is more undefined`, `Mismatch in memory`, and a
+differing return domain. The specific one lands in the `reason` field of
+`results.jsonl`.
 
 Crash is checked first: a process that hit the crash handler cannot be trusted
 to have printed a sound verdict. Every verdict is recorded in `results.jsonl`,

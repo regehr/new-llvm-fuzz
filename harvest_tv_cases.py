@@ -112,7 +112,16 @@ def classify(out, rc, timed_out):
         verdict = "unproven"
     else:
         verdict = "refused"
-    m = REASON_RE.search(out)
+    # The reason must come from after the unsoundness banner: alive2 prints
+    # unrelated "ERROR: Unsupported attribute: ..." diagnostics while building
+    # the function, and taking the first ERROR line would report one of those
+    # as the miscompile's cause.
+    tail = out
+    if verdict == "mismatch":
+        banner = UNSOUND_RE.search(out)
+        if banner:
+            tail = out[banner.end():]
+    m = REASON_RE.search(tail)
     return verdict, (m.group(1)[:160] if m else None)
 
 # `define ... @name(` -- name is either a quoted string or a bare LLVM identifier.
