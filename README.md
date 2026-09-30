@@ -47,11 +47,12 @@ python3 harvest_tv_cases.py ~/llvm-project -o tv-cases --shuffle --limit-files 2
 
 ```
 tv-cases/
-├── mismatch/  mismatch-logs/   backend-tv found a miscompilation
-├── correct/   correct-logs/    backend-tv validated the case
-├── crash/     crash-logs/      backend-tv crashed
-├── refused/   refused-logs/    backend-tv could not process it
-├── unproven/  unproven-logs/   processed, but proved nothing either way
+├── value-mismatch/  value-mismatch-logs/  backend-tv found a miscompilation
+├── more-defined/    more-defined-logs/    ... reported as "Source is more defined than target"
+├── correct/         correct-logs/         backend-tv validated the case
+├── crash/           crash-logs/           backend-tv crashed
+├── refused/         refused-logs/         backend-tv could not process it
+├── unproven/        unproven-logs/        processed, but proved nothing either way
 └── results.jsonl               one record per function validated, kept or not
 ```
 
@@ -70,16 +71,19 @@ records the source file and original function name for every case:
 | `backend-tv` outcome | Verdict | Result |
 | --- | --- | --- |
 | crashed — killed by a signal, or LLVM's crash handler ran | `crash` | kept |
-| `Transformation doesn't verify!` — any unsoundness | `mismatch` | kept |
+| `Transformation doesn't verify!` with `Source is more defined than target` | `more-defined` | kept |
+| `Transformation doesn't verify!` — any other unsoundness | `value-mismatch` | kept |
 | `Transformation seems to be correct!` | `correct` | kept |
 | `failed-to-prove` that is not a timeout | `unproven` | kept |
 | anything else — unsupported constructs, lifting failures, IR that fails to type check | `refused` | kept |
 | killed at `--hard-timeout`, or alive2 reports `ERROR: Timeout` | `timeout` | file deleted |
 
-`mismatch` keys on alive2's unsoundness banner, not on one message, so it covers
-every miscompile it can report: `Value mismatch`, `Target is more poisonous than
-source`, `Target's return value is more undefined`, `Mismatch in memory`, and a
-differing return domain. The specific one lands in the `reason` field of
+`value-mismatch` keys on alive2's unsoundness banner, not on one message, so it
+covers every miscompile it can report: `Value mismatch`, `Target is more
+poisonous than source`, `Target's return value is more undefined`, `Mismatch in
+memory`, and a differing return domain. The one exception is `Source is more
+defined than target`, which goes to `more-defined` because it has false
+positives of its own. The specific message lands in the `reason` field of
 `results.jsonl`.
 
 Crash is checked first: a process that hit the crash handler cannot be trusted

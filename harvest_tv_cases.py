@@ -24,7 +24,8 @@ Pipeline
 9. Classify the output:
        crashed in LLVM code                  -> keep in  OUT/crash-llvm/
        crashed in alive2/backend-tv code     -> keep in  OUT/crash-alive2/
-       "Value mismatch"                      -> keep in  OUT/mismatch/
+       "Source is more defined than target"  -> keep in  OUT/more-defined/
+       any other unsoundness                 -> keep in  OUT/value-mismatch/
        "Transformation seems to be correct!" -> keep in  OUT/correct/
        refused to process (unsupported, ...) -> keep in  OUT/refused/
        processed but not proved either way   -> keep in  OUT/unproven/
@@ -60,11 +61,13 @@ from concurrent.futures import ThreadPoolExecutor
 # banner, whatever the specific check was -- Value mismatch, Target is more
 # poisonous than source, Target's return value is more undefined, Mismatch in
 # memory, or a differing return domain.  Matching only "Value mismatch" would
-# file the other four as refusals.
+# file the other four as refusals.  "Source is more defined than target" is
+# split out into its own verdict, since it has false positives of its own.
 UNSOUND_RE = re.compile(r"Transformation doesn't verify!")
 # ... except TYPE_CHECKER_FAILED prints the same banner and is an error, not a
 # miscompile.
 TYPECHECK_RE = re.compile(r"program doesn't type check!")
+MORE_DEFINED = "Source is more defined than target"
 CORRECT_RE = re.compile(r"Transformation seems to be correct!")
 # First diagnostic line, recorded alongside the verdict.
 REASON_RE = re.compile(r"^ERROR: (.+?)\s*$", re.M)
@@ -93,7 +96,7 @@ LLVM_RE = re.compile(r'llvm-project|libLLVM|llvm::')
 SMT_TIMEOUT_RE = re.compile(r"^ERROR: Timeout", re.M)
 
 # Verdicts whose case file is kept, each in its own directory.
-KEPT_VERDICTS = ("mismatch", "correct", "crash-llvm", "crash-alive2", "crash",
+KEPT_VERDICTS = ("value-mismatch", "more-defined", "correct", "crash-llvm", "crash-alive2", "crash",
                  "refused", "unproven")
 
 
@@ -136,7 +139,7 @@ def classify(out, rc, timed_out):
         origin, frame = crash_origin(out)
         verdict = "crash-" + origin if origin else "crash"
     elif UNSOUND_RE.search(out) and not TYPECHECK_RE.search(out):
-        verdict = "mismatch"
+        verdict = "value-mismatch"
     elif CORRECT_RE.search(out):
         verdict = "correct"
     elif SMT_TIMEOUT_RE.search(out):
@@ -162,12 +165,15 @@ def classify(out, rc, timed_out):
                 sym = os.path.basename(mod.group(1)) if mod else ""
             return verdict, (sym[:160] or None)
     tail = out
-    if verdict == "mismatch":
+    if verdict == "value-mismatch":
         banner = UNSOUND_RE.search(out)
         if banner:
             tail = out[banner.end():]
     m = REASON_RE.search(tail)
-    return verdict, (m.group(1)[:160] if m else None)
+    reason = m.group(1)[:160] if m else None
+    if verdict == "value-mismatch" and reason == MORE_DEFINED:
+        verdict = "more-defined"
+    return verdict, reason
 
 # `define ... @name(` -- name is either a quoted string or a bare LLVM identifier.
 # A literal quote cannot appear inside a quoted name (it is spelled \22).
@@ -848,10 +854,12 @@ class Harvester:
         eta = (total - done) / rate if rate > 0 else 0
         s = self.stats.snapshot()
         sys.stderr.write(
-            "%s[%s] %d/%d  %.1f/s  eta %s  mismatch=%d correct=%d crash=%d "
+            "%s[%s] %d/%d  %.1f/s  eta %s  value-mismatch=%d more-defined=%d "
+            "correct=%d crash=%d "
             "refused=%d unproven=%d timeout=%d dup=%d   %s"
             % ("\r" if tty else "", phase, done, total, rate, fmt_dur(eta),
-               s.get("mismatch", 0), s.get("correct", 0), s.get("crash", 0),
+               s.get("value-mismatch", 0), s.get("more-defined", 0),
+               s.get("correct", 0), s.get("crash", 0),
                s.get("refused", 0), s.get("unproven", 0), s.get("timeout", 0),
                s.get("duplicates", 0), "" if tty else "\n"))
         sys.stderr.flush()
@@ -907,7 +915,7 @@ class Harvester:
             sys.stderr.write("  %-32s %d\n" % (k, v))
         sys.stderr.write("\n")
         for v in KEPT_VERDICTS:
-            sys.stderr.write("  %-8s -> %s/  (logs in %s/)\n"
+            sys.stderr.write("  %-14s -> %s/  (logs in %s/)\n"
                              % (v, os.path.basename(self.dirs[v]),
                                 os.path.basename(self.log_dirs[v])))
         sys.stderr.write("  under %s\n" % self.out)
@@ -956,7 +964,8 @@ def main(argv):
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("tree", help="path to an LLVM source tree")
     ap.add_argument("-o", "--out", default="tv-cases",
-                    help="output directory (mismatch/, correct/, logs/)")
+                    help="output directory (one <verdict>/ and "
+                         "<verdict>-logs/ per kept verdict)")
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4,
                     help="parallel workers")
     ap.add_argument("--backend", default="riscv64", help="backend-tv -backend value")
