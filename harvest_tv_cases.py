@@ -22,7 +22,8 @@ Pipeline
    much more effective, since identical bodies now hash identically.
 8. Run:  backend-tv -backend=<BACKEND> --smt-to=<MS> --fn=f file.ll
 9. Classify the output:
-       crashed (signal / crash handler)      -> keep in  OUT/crash/
+       crashed in LLVM code                  -> keep in  OUT/crash-llvm/
+       crashed in alive2/backend-tv code     -> keep in  OUT/crash-alive2/
        "Value mismatch"                      -> keep in  OUT/mismatch/
        "Transformation seems to be correct!" -> keep in  OUT/correct/
        refused to process (unsupported, ...) -> keep in  OUT/refused/
@@ -75,11 +76,44 @@ SUMMARY_RE = re.compile(
 # run observed printed both of the first two, and no cleanly-exiting run did.
 CRASH_RE = re.compile(r"PLEASE submit a bug report|Stack dump:"
                       r"|UNREACHABLE executed|Assertion `")
+# Stack-dump parsing, to say whether a crash happened in LLVM or in alive2.
+# Every frame carries its shared object, which separates the two cleanly.
+FRAME_RE = re.compile(r'^\s*#\d+ 0x[0-9a-f]+ (.*)$', re.M)
+MODULE_RE = re.compile(r'\(([^()]+?)\+0x[0-9a-f]+\)\s*$')
+# The crash-reporting machinery itself, which sits above the real crash site.
+HANDLER_RE = re.compile(
+    r'PrintStackTrace|RunSignalHandlers|SignalHandler|report_fatal_error'
+    r'|__assert_fail|abort|raise|pthread_kill|internal_signal_block_all'
+    r'|__libc_|_start\b|call_init')
+LIBC_RE = re.compile(r'/libc\.so|/ld-linux|libpthread')
+ALIVE2_RE = re.compile(r'alive2|backend-tv|backend_tv|riscv2llvm|streamerwrapper'
+                       r'|lifter::')
+LLVM_RE = re.compile(r'llvm-project|libLLVM|llvm::')
 # alive2's own solver timeout, reported on a clean exit -- a timeout, not a refusal.
 SMT_TIMEOUT_RE = re.compile(r"^ERROR: Timeout", re.M)
 
 # Verdicts whose case file is kept, each in its own directory.
-KEPT_VERDICTS = ("mismatch", "correct", "crash", "refused", "unproven")
+KEPT_VERDICTS = ("mismatch", "correct", "crash-llvm", "crash-alive2", "crash",
+                 "refused", "unproven")
+
+
+def crash_origin(out):
+    """Whose code crashed: ('llvm'|'alive2'|None, innermost real frame).
+
+    Walks the stack dump from the top, skipping the signal handler and libc
+    frames, and attributes the first real frame by the shared object it came
+    from -- falling back to the symbol text for frames printed without one.
+    """
+    for frame in FRAME_RE.findall(out):
+        if LIBC_RE.search(frame) or HANDLER_RE.search(frame):
+            continue
+        mod = MODULE_RE.search(frame)
+        for hay in ((mod.group(1),) if mod else ()) + (frame,):
+            if ALIVE2_RE.search(hay):
+                return "alive2", frame
+            if LLVM_RE.search(hay):
+                return "llvm", frame
+    return None, None
 
 
 def summary_counts(out):
@@ -99,7 +133,8 @@ def classify(out, rc, timed_out):
     if timed_out:
         verdict = "timeout"
     elif (rc is not None and rc < 0) or CRASH_RE.search(out):
-        verdict = "crash"
+        origin, frame = crash_origin(out)
+        verdict = "crash-" + origin if origin else "crash"
     elif UNSOUND_RE.search(out) and not TYPECHECK_RE.search(out):
         verdict = "mismatch"
     elif CORRECT_RE.search(out):
@@ -116,6 +151,16 @@ def classify(out, rc, timed_out):
     # unrelated "ERROR: Unsupported attribute: ..." diagnostics while building
     # the function, and taking the first ERROR line would report one of those
     # as the miscompile's cause.
+    if verdict.startswith("crash"):
+        # For a crash the useful label is where it crashed, not any ERROR line.
+        frame = crash_origin(out)[1]
+        if frame:
+            sym = re.sub(r'\s*\([^()]*\+0x[0-9a-f]+\)\s*$', '', frame).strip()
+            if not sym:
+                # Frame printed without a symbol; name the object instead.
+                mod = MODULE_RE.search(frame)
+                sym = os.path.basename(mod.group(1)) if mod else ""
+            return verdict, (sym[:160] or None)
     tail = out
     if verdict == "mismatch":
         banner = UNSOUND_RE.search(out)
